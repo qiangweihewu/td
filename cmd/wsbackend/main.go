@@ -131,7 +131,10 @@ func extractHistory(res tg.MessagesMessagesClass) []historyMsg {
 		if !ok {
 			continue
 		}
-		hm := historyMsg{ID: msg.GetID(), Text: msg.GetMessage()}
+		hm := historyMsg{ID: msg.GetID()}
+		if tm, ok := msg.(*tg.Message); ok {
+			hm.Text = tm.GetMessage()
+		}
 		if from, ok := msg.GetFromID(); ok {
 			p, err := entities.ExtractPeer(from)
 			if err == nil {
@@ -355,7 +358,7 @@ func (s *clientSession) run(ctx context.Context) error {
 						continue
 					}
 					// ignoring resolve errors for brevity
-					if err := sender.To(input).Text(ctx, req.Message); err != nil {
+					if _, err := sender.To(input).Text(ctx, req.Message); err != nil {
 						s.log.Error("send", zap.Error(err))
 					}
 				case "dialogs":
@@ -393,6 +396,92 @@ func (s *clientSession) run(ctx context.Context) error {
 					}
 					msgs := extractHistory(h)
 					if err := s.write(ctx, wsResponse{Type: "history", Data: msgs}); err != nil {
+						return err
+					}
+				case "self":
+					full, err := api.UsersGetFullUser(ctx, &tg.InputUserSelf{})
+					if err != nil {
+						_ = s.write(ctx, wsResponse{Type: "error", Error: err.Error()})
+						continue
+					}
+					if err := s.write(ctx, wsResponse{Type: "self", Data: full}); err != nil {
+						return err
+					}
+				case "contacts":
+					res, err := api.ContactsGetContacts(ctx, 0)
+					if err != nil {
+						_ = s.write(ctx, wsResponse{Type: "error", Error: err.Error()})
+						continue
+					}
+					type contact struct {
+						ID   int64  `json:"id"`
+						Name string `json:"name"`
+					}
+					var list []contact
+					if c, ok := res.(*tg.ContactsContacts); ok {
+						for _, u := range c.Users {
+							if user, ok := u.(*tg.User); ok {
+								name := strings.TrimSpace(strings.TrimSpace(user.FirstName + " " + user.LastName))
+								if name == "" {
+									name = user.Username
+								}
+								list = append(list, contact{ID: user.ID, Name: name})
+							}
+						}
+					}
+					if err := s.write(ctx, wsResponse{Type: "contacts", Data: list}); err != nil {
+						return err
+					}
+				case "participants":
+					if req.Peer == "" {
+						continue
+					}
+					limit := req.Limit
+					if limit <= 0 || limit > 100 {
+						limit = 50
+					}
+					p := peer.Resolve(peer.Plain(api), req.Peer)
+					input, err := p(ctx)
+					if err != nil {
+						s.log.Error("resolve", zap.Error(err))
+						continue
+					}
+					ch, ok := input.(*tg.InputPeerChannel)
+					if !ok {
+						_ = s.write(ctx, wsResponse{Type: "error", Error: "peer is not a channel"})
+						continue
+					}
+					participants, err := api.ChannelsGetParticipants(ctx, &tg.ChannelsGetParticipantsRequest{
+						Channel: &tg.InputChannel{ChannelID: ch.ChannelID, AccessHash: ch.AccessHash},
+						Filter:  &tg.ChannelParticipantsRecent{},
+						Limit:   limit,
+					})
+					if err != nil {
+						_ = s.write(ctx, wsResponse{Type: "error", Error: err.Error()})
+						continue
+					}
+					type member struct {
+						ID   int64  `json:"id"`
+						Name string `json:"name"`
+					}
+					var ents peer.Entities
+					if d, ok := participants.(*tg.ChannelsChannelParticipants); ok {
+						ents = peer.EntitiesFromResult(d)
+					} else if _, ok := participants.(*tg.ChannelsChannelParticipantsNotModified); ok {
+						_ = s.write(ctx, wsResponse{Type: "participants", Data: []member{}})
+						continue
+					}
+					var list []member
+					if len(ents.Users()) > 0 {
+						for id, usr := range ents.Users() {
+							name := strings.TrimSpace(strings.TrimSpace(usr.FirstName + " " + usr.LastName))
+							if name == "" {
+								name = usr.Username
+							}
+							list = append(list, member{ID: id, Name: name})
+						}
+					}
+					if err := s.write(ctx, wsResponse{Type: "participants", Data: list}); err != nil {
 						return err
 					}
 				}
